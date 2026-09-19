@@ -975,3 +975,48 @@ async def test_refresh_400_recovery_rejects_disk_pair_from_another_issuer(tmp_pa
     assert recovered is False
     assert provider.context.current_tokens is None
     assert (await storage.get_tokens()).refresh_token is None, "foreign refresh token must not survive on disk"
+
+
+# ---------------------------------------------------------------------------
+# Google Workspace MCP compatibility: issuer trailing slash + configured scope
+# ---------------------------------------------------------------------------
+
+def test_issuer_validation_tolerates_only_a_trailing_slash_difference():
+    import tools.mcp_oauth_manager  # noqa: F401 — installs the tolerance at import
+    from mcp.client.auth import oauth2
+    from mcp.client.auth.exceptions import OAuthFlowError
+
+    assert getattr(oauth2.validate_metadata_issuer, "_hermes_slash_compatible", False)
+    meta = SimpleNamespace(issuer="https://accounts.google.com")
+    oauth2.validate_metadata_issuer(meta, "https://accounts.google.com/")  # Google's PRM spelling
+    oauth2.validate_metadata_issuer(meta, "https://accounts.google.com")
+    with pytest.raises(OAuthFlowError):  # a genuinely different issuer is still rejected
+        oauth2.validate_metadata_issuer(meta, "https://accounts.evil.example")
+
+    # Idempotent: re-installing must not wrap the wrapper.
+    before = oauth2.validate_metadata_issuer
+    tools.mcp_oauth_manager._install_issuer_trailing_slash_tolerance()
+    assert oauth2.validate_metadata_issuer is before
+
+
+@pytest.mark.asyncio
+async def test_configured_scope_is_restored_before_the_consent_request(tmp_path, monkeypatch):
+    """The SDK swaps the configured scope for every scope the resource advertises (Google lists
+    destructive Gmail scopes); the consent URL must carry what the operator configured."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = _provider_with_token_endpoint(
+        tmp_path, {"scope": "https://www.googleapis.com/auth/gmail.readonly"},
+        "https://oauth2.googleapis.com/token", monkeypatch)
+    assert provider._hermes_configured_scope == "https://www.googleapis.com/auth/gmail.readonly"
+
+    provider.context.client_metadata.scope = "https://mail.google.com/ https://www.googleapis.com/auth/gmail.modify"
+    seen = {}
+
+    async def _sdk_perform_authorization(self):
+        seen["scope"] = self.context.client_metadata.scope
+        return ("code", "verifier")
+
+    from tools.mcp_oauth_provider import HermesProviderMixin
+    monkeypatch.setattr(HermesProviderMixin, "_perform_authorization", _sdk_perform_authorization)
+    assert await provider._perform_authorization() == ("code", "verifier")
+    assert seen["scope"] == "https://www.googleapis.com/auth/gmail.readonly"

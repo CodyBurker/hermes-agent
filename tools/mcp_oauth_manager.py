@@ -27,6 +27,31 @@ except ImportError:  # pragma: no cover — SDK required in CI; module must stil
     _SDK_BASES = ()
 
 
+def _install_issuer_trailing_slash_tolerance() -> None:
+    """Google's Workspace MCP protected-resource metadata advertises ``https://accounts.google.com/``
+    while the authorization-server metadata names the same issuer without the trailing slash. MCP SDK
+    2.0 compares the two strings literally and aborts before showing consent. Treat a trailing-slash-only
+    difference as equivalent; every other mismatch keeps the SDK's strict validation. Idempotent."""
+    try:
+        from mcp.client.auth import oauth2 as oauth2_module
+    except ImportError:  # pragma: no cover — SDK required in CI
+        return
+    sdk_validate = getattr(oauth2_module, "validate_metadata_issuer", None)
+    if sdk_validate is None or getattr(sdk_validate, "_hermes_slash_compatible", False):
+        return
+
+    def _validate_metadata_issuer_slash_compatible(metadata: Any, expected_issuer: str) -> None:
+        if str(metadata.issuer).rstrip("/") == str(expected_issuer).rstrip("/"):
+            return
+        sdk_validate(metadata, expected_issuer)
+
+    _validate_metadata_issuer_slash_compatible._hermes_slash_compatible = True  # type: ignore[attr-defined]
+    oauth2_module.validate_metadata_issuer = _validate_metadata_issuer_slash_compatible
+
+
+_install_issuer_trailing_slash_tolerance()
+
+
 @dataclass
 class _ProviderEntry:
     """Per-server OAuth state. ``last_mtime_ns``: last-seen tokens-file mtime (0 = never read)
@@ -63,6 +88,16 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
         self._hermes_home = ""
         # A config-supplied client_id rejected as invalid_client means the *config* is wrong — only DCR clients auto-heal.
         self._hermes_preregistered = preregistered
+        # The SDK replaces an explicitly configured client scope with every scope advertised by
+        # protected-resource metadata. Google Workspace MCP advertises destructive Gmail scopes even when
+        # the client asked for gmail.readonly, so remember the configured scope and restore it just
+        # before the consent request is built.
+        self._hermes_configured_scope = getattr(self.context.client_metadata, "scope", None)
+
+    async def _perform_authorization(self):
+        if self._hermes_configured_scope:
+            self.context.client_metadata.scope = self._hermes_configured_scope
+        return await super()._perform_authorization()
 
     def _hermes_storage(self):
         """The context storage when it is a ``HermesTokenStorage``, else None."""
@@ -127,7 +162,9 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                 if prm:
                     self.context.protected_resource_metadata = prm
                     if prm.authorization_servers:
-                        self.context.auth_server_url = str(prm.authorization_servers[0])
+                        # Google's PRM says https://accounts.google.com/ but its OAuth metadata issuer has no
+                        # trailing slash and the SDK compares literally — normalize before validation.
+                        self.context.auth_server_url = str(prm.authorization_servers[0]).rstrip("/")
                     break
             # ASM discovery against auth_server_url (server_url fallback for legacy providers).
             for url in build_oauth_authorization_server_metadata_discovery_urls(self.context.auth_server_url, server_url):
