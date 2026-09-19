@@ -158,6 +158,23 @@ class TestTakeCheckpoint:
         assert mgr.ensure_checkpoint("/", "root") is False
         assert mgr.ensure_checkpoint(str(Path.home()), "home") is False
 
+    def test_skips_shared_temp_root_but_not_projects_inside_it(self, mgr, work_dir, tmp_path, monkeypatch):
+        # A scratch file written to /tmp/foo.py resolves to working_dir == /tmp:
+        # shared, volatile, full of unreadable systemd-private-* dirs and files
+        # that vanish mid-scan, so ``git add -A`` there is slow and fails.
+        import tempfile
+        fake_tmp = tmp_path / "faketmp"
+        fake_tmp.mkdir()
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_tmp))
+        assert mgr.ensure_checkpoint(str(fake_tmp), "temp root") is False
+        assert mgr.ensure_checkpoint("/tmp", "tmp") is False
+        assert mgr.ensure_checkpoint("/var/tmp", "var tmp") is False
+        # A real project directory that merely lives under the temp root is fine.
+        proj = fake_tmp / "proj"
+        proj.mkdir()
+        (proj / "a.py").write_text("x = 1\n")
+        assert mgr.ensure_checkpoint(str(proj), "project under tmp") is True
+
     def test_new_turn_resets_dedup_but_needs_changes(self, mgr, work_dir):
         assert mgr.ensure_checkpoint(str(work_dir), "turn 1") is True
         mgr.new_turn()

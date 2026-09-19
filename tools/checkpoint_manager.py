@@ -210,6 +210,25 @@ def _git_env(store: Path, working_dir: str, index_file: Optional[Path] = None) -
     return env
 
 
+def _too_broad_dirs() -> Set[str]:
+    """Directories never snapshotted: ``/``, home, and the shared system temp roots.  A scratch file
+    written to ``/tmp/x.py`` has no project marker above it, so its working dir resolves to ``/tmp``
+    itself — world-writable, full of other processes' files, unreadable ``systemd-private-*`` dirs and
+    files that vanish mid-scan, where ``git add -A`` is slow and fails.  Projects *inside* a temp root
+    are still checkpointed.  Paths are symlink-resolved (macOS ``/tmp`` -> ``/private/tmp``)."""
+    import tempfile
+    roots = [Path("/"), Path.home(), Path(tempfile.gettempdir()), Path("/tmp"), Path("/var/tmp"),
+             Path("/private/tmp"), Path("/private/var/tmp")]
+    out: Set[str] = set()
+    for root in roots:
+        out.add(str(root))
+        try:
+            out.add(str(root.resolve()))
+        except OSError:  # pragma: no cover — unresolvable root: the literal path still guards
+            pass
+    return out
+
+
 def _git_subprocess(cmd: List[str], env: dict, timeout: int, cwd: Optional[str] = None):
     # creationflags suppresses the per-call conhost flash on Windows (no-op on POSIX).
     # Text mode both replaces undecodable path bytes and normalizes CR/CRLF.
@@ -703,7 +722,7 @@ class CheckpointManager:
         if not self._git_available:
             return False
         abs_dir = str(_normalize_path(working_dir))
-        if abs_dir in {"/", str(Path.home())}:  # never snapshot root/home
+        if abs_dir in _too_broad_dirs():  # never snapshot root, home or a shared temp root
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
             return False
         if abs_dir in self._checkpointed_dirs:
