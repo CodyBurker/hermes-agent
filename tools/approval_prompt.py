@@ -297,6 +297,18 @@ def request_elicitation_consent(message: str, description: str, *,
         logger.warning("Elicitation consent: session lookup failed: %s", exc)
         return "decline"
 
+    # Allowlist short-circuit (opt-in): an operator who put the exact ``mcp_elicitation`` pattern in
+    # command_allowlist gets MCP elicitations auto-accepted. Scoped to the elicitation surface ONLY —
+    # this function also gates untrusted-server tool calls (``mcp-trust/…``) and payment-card fills
+    # (``vault-payment``), which must keep prompting no matter what is allowlisted.
+    if surface == "mcp-elicitation" or surface.startswith("mcp-elicitation/"):
+        try:
+            if _a.is_approved(session_key, "mcp_elicitation"):
+                logger.info("Elicitation consent auto-accepted (mcp_elicitation allowlisted) on %s", surface)
+                return "accept"
+        except Exception as exc:  # pragma: no cover -- defensive
+            logger.warning("Elicitation consent allowlist check failed: %s", exc)
+
     # api_server is an unattended *platform* for the dangerous-command gate, but a live ``/v1/runs`` run
     # registers an approval notify callback and answers via ``POST /v1/runs/{id}/approval``
     # (gateway/platforms/api_server_runs.py), so its per-call MCP consent takes the gateway path too.
