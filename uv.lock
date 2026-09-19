@@ -8,7 +8,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-09-05T18:11:48.257716637Z"
+exclude-newer = "2026-09-05T18:16:02.595406312Z"
 exclude-newer-span = "P14D"
 
 [options.exclude-newer-package]
@@ -1782,6 +1782,7 @@ all = [
     { name = "google-auth" },
     { name = "google-auth-httplib2" },
     { name = "google-auth-oauthlib" },
+    { name = "httpcore2" },
     { name = "httplib2" },
     { name = "httpx2" },
     { name = "mcp" },
@@ -1801,6 +1802,7 @@ bedrock = [
     { name = "boto3" },
 ]
 computer-use = [
+    { name = "httpcore2" },
     { name = "httpx2" },
     { name = "mcp" },
     { name = "starlette" },
@@ -1810,6 +1812,7 @@ daytona = [
 ]
 dev = [
     { name = "debugpy" },
+    { name = "httpcore2" },
     { name = "httpx2" },
     { name = "mcp" },
     { name = "pytest" },
@@ -1874,6 +1877,7 @@ matrix = [
     { name = "mautrix", extra = ["encryption"] },
 ]
 mcp = [
+    { name = "httpcore2" },
     { name = "httpx2" },
     { name = "mcp" },
     { name = "starlette" },
@@ -1921,6 +1925,7 @@ teams = [
 termux = [
     { name = "agent-client-protocol" },
     { name = "honcho-ai" },
+    { name = "httpcore2" },
     { name = "httpx2" },
     { name = "mcp" },
     { name = "python-telegram-bot", extra = ["webhooks"] },
@@ -1935,6 +1940,7 @@ termux-all = [
     { name = "google-auth-httplib2" },
     { name = "google-auth-oauthlib" },
     { name = "honcho-ai" },
+    { name = "httpcore2" },
     { name = "httplib2" },
     { name = "httpx2" },
     { name = "mcp" },
@@ -2049,6 +2055,9 @@ requires-dist = [
     { name = "hermes-agent", extras = ["youtube"], marker = "extra == 'all'" },
     { name = "hindsight-client", marker = "extra == 'hindsight'", specifier = "==0.6.1" },
     { name = "honcho-ai", marker = "extra == 'honcho'", specifier = "==2.2.0" },
+    { name = "httpcore2", marker = "extra == 'computer-use'", specifier = "==2.12.0" },
+    { name = "httpcore2", marker = "extra == 'dev'", specifier = "==2.12.0" },
+    { name = "httpcore2", marker = "extra == 'mcp'", specifier = "==2.12.0" },
     { name = "httplib2", marker = "extra == 'google'", specifier = "==0.32.0" },
     { name = "httplib2", marker = "extra == 'google-chat'", specifier = "==0.32.0" },
     { name = "httpx", extras = ["socks"], specifier = "==0.28.1" },

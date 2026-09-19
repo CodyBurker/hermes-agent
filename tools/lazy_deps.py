@@ -199,6 +199,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "tool.computer_use": (
         "mcp==2.0.0",
         "httpx2==2.12.0",  # mcp 2.x HTTP stack — sync with pyproject [computer-use]
+        "httpcore2==2.12.0",  # httpx2's transport — pinned with it, sync with pyproject [computer-use]
         "starlette==1.3.1",
     ),
     # huggingface-hub is SHARED with transformers (>=1.5.0,<2 via Hindsight) and marked active
