@@ -351,3 +351,40 @@ class TestRequestedSchemaFieldName:
         # An empty schema renders the generic "Approval requested by ..."
         # fallback, so the field name is what proves the schema was read.
         assert "card_number" in (captured.get("description") or ""), captured
+
+
+class TestElicitationAllowlistShortCircuit:
+    """An allowlisted ``mcp_elicitation`` pattern auto-accepts MCP elicitations — and nothing else
+    that happens to share ``request_elicitation_consent``."""
+
+    @staticmethod
+    def _consent(surface, approved=True):
+        from tools import approval_prompt
+
+        prompted = []
+
+        def _cli_prompt(*args, **kwargs):
+            prompted.append(surface)
+            return "deny"
+
+        with patch("tools.approval.is_approved", return_value=approved), \
+             patch.object(approval_prompt._ctx, "get_current_session_key", return_value="sess"), \
+             patch.object(approval_prompt._ctx, "_is_gateway_approval_context", return_value=False), \
+             patch.object(approval_prompt._ctx, "_get_session_platform", return_value="cli"), \
+             patch.object(approval_prompt, "prompt_dangerous_approval", _cli_prompt):
+            answer = approval_prompt.request_elicitation_consent("msg", "desc", timeout_seconds=1, surface=surface)
+        return answer, prompted
+
+    def test_allowlisted_elicitation_is_auto_accepted_without_prompting(self):
+        for surface in ("mcp-elicitation", "mcp-elicitation/yarr"):
+            assert self._consent(surface) == ("accept", [])
+
+    def test_not_allowlisted_still_prompts(self):
+        answer, prompted = self._consent("mcp-elicitation/yarr", approved=False)
+        assert answer != "accept" and prompted == ["mcp-elicitation/yarr"]
+
+    def test_trust_gate_and_payment_fill_always_prompt_even_when_allowlisted(self):
+        for surface in ("mcp-trust/evil", "vault-payment"):
+            answer, prompted = self._consent(surface)
+            assert answer != "accept", f"{surface} must never be auto-accepted by the elicitation allowlist"
+            assert prompted == [surface]
