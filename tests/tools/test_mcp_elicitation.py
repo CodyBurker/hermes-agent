@@ -82,6 +82,34 @@ class TestElicitationHandlerFormMode:
         assert handler.metrics["accepted"] == 1
         assert handler.metrics["declined"] == 0
 
+    def test_required_boolean_confirm_is_true_on_accept(self):
+        """Servers such as Yarr require an explicit confirm=true payload."""
+        handler = ElicitationHandler("yarr", {"timeout": 5})
+        params = _form_params(
+            "confirm destructive delete",
+            {
+                "type": "object",
+                "properties": {"confirm": {"type": "boolean"}},
+                "required": ["confirm"],
+            },
+        )
+
+        with patch("tools.approval_prompt.request_elicitation_consent", return_value="accept"):
+            result = asyncio.run(handler(context=None, params=params))
+
+        assert result.action == "accept"
+        assert result.content == {"confirm": True}
+
+    def test_optional_or_non_boolean_confirm_is_not_filled_in(self):
+        handler = ElicitationHandler("yarr", {"timeout": 5})
+        for schema in (
+            {"properties": {"confirm": {"type": "boolean"}}},                           # not required
+            {"properties": {"confirm": {"type": "string"}}, "required": ["confirm"]},  # not a boolean
+        ):
+            with patch("tools.approval_prompt.request_elicitation_consent", return_value="accept"):
+                result = asyncio.run(handler(context=None, params=_form_params("x", schema)))
+            assert result.content == {}
+
 
     @pytest.mark.usefixtures("require_mcp_2_sdk")
     def test_schema_read_from_real_sdk_params_reaches_the_summary(self):

@@ -267,10 +267,22 @@ class ElicitationHandler:
         """Kwargs to pass to ClientSession for elicitation support."""
         return {"elicitation_callback": self}
 
-    def _result(self, action: str, metric: str):
-        """Count *metric* and return ``ElicitResult(action)`` (accept carries empty content)."""
+    @staticmethod
+    def _accept_content(schema) -> dict:
+        """Form values for an accept. Destructive MCPs such as Yarr request a single required boolean
+        named ``confirm`` and proceed only when it is explicitly true; an empty object made an approval
+        look like a decline to the server even though the user pressed Approve."""
+        if not isinstance(schema, dict):
+            return {}
+        field = (schema.get("properties") or {}).get("confirm")
+        if "confirm" in (schema.get("required") or []) and isinstance(field, dict) and field.get("type") == "boolean":
+            return {"confirm": True}
+        return {}
+
+    def _result(self, action: str, metric: str, schema=None):
+        """Count *metric* and return ``ElicitResult(action)`` (accept carries the required confirm, else empty content)."""
         self.metrics[metric] += 1
-        return _core.ElicitResult(action=action, **({"content": {}} if action == "accept" else {}))
+        return _core.ElicitResult(action=action, **({"content": self._accept_content(schema)} if action == "accept" else {}))
 
     def _consent_thunk(self, message: str, description: str) -> Callable[[], str]:
         """Sync consent call replaying the agent's contextvars snapshot when the owning task captured one
@@ -310,4 +322,4 @@ class ElicitationHandler:
         except Exception as exc:
             logger.error("MCP server '%s' elicitation failed: %s", self.server_name, exc, exc_info=True)
             return self._result("decline", "errors")
-        return self._result(*self._ANSWER_RESULTS.get(answer, ("decline", "declined")))
+        return self._result(*self._ANSWER_RESULTS.get(answer, ("decline", "declined")), schema=schema)
