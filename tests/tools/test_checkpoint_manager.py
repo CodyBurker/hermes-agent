@@ -744,7 +744,7 @@ class TestGitEnvIsolation:
 class TestErrorResilience:
 
 
-    def test_timeout_removes_the_index_lock_our_killed_git_left_behind(self, tmp_path):
+    def test_timeout_removes_the_index_lock_our_killed_git_left_behind(self, tmp_path, monkeypatch):
         # subprocess.run() SIGKILLs git on timeout, so git never deletes its
         # ``<index>.lock``.  Left in place, every later checkpoint of the project
         # fails forever with "Unable to create ...lock: File exists".
@@ -758,8 +758,8 @@ class TestErrorResilience:
             lock.write_text("")  # git took the lock, then got killed
             raise subprocess.TimeoutExpired(cmd="git add -A", timeout=60)
 
-        with patch("tools.checkpoint_manager.subprocess.run", side_effect=killed_mid_add):
-            ok, _, err = _run_git(["add", "-A"], tmp_path / "store", str(work), index_file=index_file)
+        monkeypatch.setattr("tools.checkpoint_manager.subprocess.run", killed_mid_add)
+        ok, _, err = _run_git(["add", "-A"], tmp_path / "store", str(work), index_file=index_file)
         assert ok is False
         assert "timed out" in err
         assert not lock.exists()
