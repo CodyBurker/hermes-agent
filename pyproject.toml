@@ -92,10 +92,18 @@ dependencies = [
   # it out of the lazy-install path that exists only for the heavy matrix deps.
   "Markdown==3.10.2; python_version >= '3.14'",
   # Skills Hub (GitHub App JWT auth — optional, only needed for bot identity)
-  "PyJWT[crypto]==2.13.0; python_version >= '3.14'",  # PYSEC-2026-175/177/178/179
-  # urllib3 2.7.0 fixes GHSA-mf9v-mfxr-j63j (decompression-bomb bypass)
-  # and GHSA-qccp-gfcp-xxvc (header leak across origins).
-  "urllib3>=2.7.0,<3; python_version >= '3.14'",
+  # Cody's fork: security floor applied to EVERY python. Upstream gates this line at
+  # 'python_version >= 3.14', which left our 3.11 runtime resolving the pinned-vulnerable
+  # 2.13.0 through mcp's `pyjwt[crypto]>=2.10.1`. 2.14.0 fixed PYSEC-2026-4144..4152 /
+  # GHSA-w2cx-738m-mc7w (public keys and public JWK containers accepted as HMAC secrets,
+  # BOM bypass, malformed-RSA-JWK DoS, ReDoS in is_pem_format).
+  "PyJWT[crypto]==2.15.1",
+  # urllib3 2.8.0 fixes GHSA-8988-9cw3-xx77 (HTTPS proxy TLS config ignored/overridden),
+  # GHSA-vxq7-64xx-v4gw (unbounded chunk-size line in HTTPResponse.stream()) and
+  # GHSA-gh4c-6fx4-qh6g (chunked deflate infinite loop). 2.7.0 had fixed
+  # GHSA-mf9v-mfxr-j63j (decompression-bomb bypass) and GHSA-qccp-gfcp-xxvc (header leak
+  # across origins). Same marker removal as PyJWT above so the floor holds on 3.11.
+  "urllib3>=2.8.0,<3",
   # PyJWT[crypto] pulls cryptography in transitively. Pin it here as well, so
   # that the WeCom and Weixin crypto paths cannot fall below the patched
   # version. 50.0.0 is the floor: it fixes CVE-2026-69247, a Bleichenbacher
@@ -699,6 +707,13 @@ exclude-newer = "14 days"
 # google-cloud-pubsub: same exact-pin shape (==2.39.2, google-chat adapter).
 # The pin bump WAS the review; exclude-newer only filters it because the
 # 14-day window is younger than the reviewed release.
+#
+# oauthlib (Cody's fork): security-only exception. 4.0.0 fixes GHSA-2j3v-4v7x-9c8q
+# (PKCE timing side-channel) and the JSONP-injection advisory in the revocation
+# endpoint; it was published 2026-09-28, so the 14-day cutoff hides it and the
+# resolver silently keeps the vulnerable 3.3.1 (nothing else bounds oauthlib —
+# requests-oauthlib requires it unpinned). Exempt it so the lock can carry the
+# fixed release; the dependency is transitive, so this grants no other float.
 
 [tool.uv.exclude-newer-package]
 agent-client-protocol = false
@@ -755,6 +770,7 @@ modal = false
 nemo-relay = false
 neutts = "2026-07-22T14:54:23Z"
 numpy = false
+oauthlib = false
 openai = false
 opentelemetry-exporter-otlp-proto-http = false
 opentelemetry-sdk = false
