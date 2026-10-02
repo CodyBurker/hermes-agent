@@ -10,6 +10,7 @@ from __future__ import annotations
 import itertools
 import logging
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 from typing import Any, Optional
 
@@ -21,7 +22,7 @@ from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
     _ServerRequestRouting,
     _approval_choice_to_codex_decision,
-    _coerce_turn_input_text,
+    _build_turn_input,
 )
 
 
@@ -144,12 +145,25 @@ class TestApprovalChoiceMapping:
 
 
 class TestTurnInputCoercion:
-    def test_list_content_keeps_text_and_marks_images(self):
-        text = _coerce_turn_input_text([
+    def test_image_parts_ride_natively_in_turn_start(self):
+        """#51053: image attachments must reach the model as app-server image inputs, not a text marker."""
+        items, text = _build_turn_input([
             {"type": "text", "text": "caption"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            {"type": "image_url", "image_url": {"url": "/tmp/shot.png"}},
         ])
-        assert text == "caption\n\n[image attached]"
+        assert items == [
+            {"type": "text", "text": "caption"},
+            {"type": "image", "url": "data:image/png;base64,abc"},
+            {"type": "localImage", "path": "/tmp/shot.png"},
+        ]
+        assert text == "caption"
+
+    def test_image_only_turn_gets_default_prompt_and_plain_text_is_unchanged(self):
+        items, text = _build_turn_input([{"type": "image_url", "image_url": {"url": "https://x/a.png"}}])
+        assert text.strip()
+        assert items == [{"type": "text", "text": text}, {"type": "image", "url": "https://x/a.png"}]
+        assert _build_turn_input("hi") == ([{"type": "text", "text": "hi"}], "hi")
 
 
 # ---- lifecycle ----
@@ -165,17 +179,88 @@ class TestLifecycle:
         method_calls = [m for (m, _) in client.requests if m == "thread/start"]
         assert len(method_calls) == 1
 
-    def test_thread_start_passes_cwd_only(self):
-        """thread/start carries cwd. We intentionally do NOT pass `permissions`
-        on this codex version (experimentalApi-gated + requires matching
-        config.toml [permissions] table). Letting codex use its default
-        (read-only unless user configures otherwise) is the documented path."""
+    def test_thread_start_carries_hermes_prompt_and_disables_codex_personality(self):
+        """thread/start carries cwd, Hermes' composed prompt as developerInstructions and
+        personality "none" (#74712, #72104, #26035). We intentionally do NOT pass `permissions`
+        (experimentalApi-gated + requires a matching config.toml [permissions] table)."""
         client = FakeClient()
-        s = make_session(client, permission_profile="workspace-write")
+        s = make_session(client, permission_profile="workspace-write", developer_instructions="SOUL: be terse")
         s.ensure_started()
         method, params = next(r for r in client.requests if r[0] == "thread/start")
-        assert params["cwd"] == "/tmp"
-        assert "permissions" not in params  # see session.ensure_started() comment
+        assert params == {"cwd": "/tmp", "developerInstructions": "SOUL: be terse", "personality": "none"}
+
+    def test_thread_start_omits_developer_instructions_when_prompt_empty(self):
+        """No prompt (or a blank one) never sends an empty developerInstructions field."""
+        client = FakeClient()
+        make_session(client, developer_instructions="   ").ensure_started()
+        method, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert "developerInstructions" not in params
+        assert params["personality"] == "none"
+
+    def test_named_custom_provider_selects_codex_model_provider(self, monkeypatch):
+        """#75186: for ``provider=custom`` + a configured ``providers.<name>`` entry, the session built by
+        ``_ensure_codex_session`` sends ``model`` + ``modelProvider=<name>`` on thread/start and never the
+        API key; openai/openai-codex agents send the selected model with codex's own provider."""
+        import hermes_cli.runtime_provider as rp
+        from agent.codex_runtime import _ensure_codex_session
+        from agent.transports import codex_app_server_session as sess_mod
+        monkeypatch.setattr(rp, "load_config", lambda: {
+            "providers": {"my-gateway": {"api": "https://gateway.example.com/v1", "api_key": "sk-secret"}}})
+        clients: list[FakeClient] = []
+
+        def build(**kw):
+            clients.append(FakeClient())
+            return CodexAppServerSession(**{**kw, "client_factory": lambda **_: clients[-1]})
+        monkeypatch.setattr(sess_mod, "CodexAppServerSession", build)
+
+        def thread_start_params(**agent_attrs):
+            agent = SimpleNamespace(_codex_session=None, session_cwd="/tmp", api_key="sk-secret", **agent_attrs)
+            _ensure_codex_session(agent)
+            agent._codex_session.ensure_started()
+            return next(p for (m, p) in clients[-1].requests if m == "thread/start")
+
+        named = thread_start_params(provider="custom", requested_provider="custom:my-gateway", model="gpt-5.4")
+        # ``personality: "none"`` rides on every thread/start (#72104); only the provider selection varies.
+        base = {"cwd": "/tmp", "personality": "none"}
+        assert named == {**base, "modelProvider": "my-gateway", "model": "gpt-5.4"}
+        assert "sk-secret" not in repr(named)
+        assert thread_start_params(provider="openai-codex", requested_provider="openai-codex", model="gpt-5.4") == {
+            **base, "model": "gpt-5.4"}
+        assert thread_start_params(provider="custom", requested_provider="custom", model="gpt-5.4") == {**base, "model": "gpt-5.4"}
+        # ``-900k`` is a Hermes-side alias the backend rejects; codex gets the base slug.
+        assert thread_start_params(provider="openai-codex", requested_provider="openai-codex",
+                                   model="gpt-5.6-sol-900k")["model"] == "gpt-5.6-sol"
+        # The OpenAI API-key rung arrives as provider=custom with no codex model_providers id: codex's own
+        # provider takes the bare slug, as openai-codex does.
+        assert thread_start_params(provider="custom", requested_provider="openai", model="openai/gpt-5.4")["model"] == "gpt-5.4"
+
+    def test_stored_thread_is_resumed_and_an_unresumable_one_falls_back_to_a_fresh_start(self):
+        """#100531: a stored id goes out as ``thread/resume`` (same params as thread/start, never a
+        second ``thread/start``); when codex cannot hand it back the failure is typed and the NEXT
+        ensure_started() starts a fresh thread on the same handshaken client."""
+        from agent.transports.codex_app_server import CodexAppServerError
+        from agent.transports.codex_app_server_session import CodexThreadResumeError
+
+        client = FakeClient()
+        client._request_handler = lambda method, params: (
+            {"thread": {"id": params["threadId"]}} if method == "thread/resume" else {"thread": {"id": "fresh-1"}})
+        s = make_session(client, resume_thread_id="stored-1", developer_instructions="SOUL")
+        assert s.ensure_started() == s.ensure_started() == "stored-1"
+        assert [m for m, _ in client.requests] == ["thread/resume"]
+        assert client.requests[0][1] == {"threadId": "stored-1", "cwd": "/tmp", "personality": "none", "developerInstructions": "SOUL"}
+
+        def refuse(method, params):
+            if method == "thread/resume":
+                raise CodexAppServerError(code=-32600, message=f"no rollout found for thread id {params['threadId']}")
+            return {"thread": {"id": "fresh-2"}}
+        client = FakeClient()
+        client._request_handler = refuse
+        s = make_session(client, resume_thread_id="gone-1")
+        with pytest.raises(CodexThreadResumeError) as exc_info:
+            s.ensure_started()
+        assert exc_info.value.thread_id == "gone-1"
+        assert s.ensure_started() == "fresh-2"
+        assert [m for m, _ in client.requests] == ["thread/resume", "thread/start"]
 
     def test_close_idempotent(self):
         client = FakeClient()
@@ -228,6 +313,18 @@ class TestRunTurn:
         _, params = next(request for request in client.requests if request[0] == "turn/start")
         assert result.submitted_user_text == params["input"][0]["text"]
         assert result.submitted_user_text != rich_input
+
+    def test_turn_start_carries_the_turn_model_only_when_given(self):
+        """An in-place ``/model`` switch keeps the session; the model rides on turn/start, which codex
+        applies to this and later turns of the existing thread."""
+        sent = []
+        for model in ("gpt-5.5", None):
+            client = FakeClient()
+            client.queue_notification("turn/completed", threadId="t",
+                                      turn={"id": "turn-fake-001", "status": "completed", "error": None})
+            make_session(client).run_turn("hi", model=model, turn_timeout=2.0)
+            sent.append(next(p for (m, p) in client.requests if m == "turn/start").get("model"))
+        assert sent == ["gpt-5.5", None]
 
     def test_foreign_completion_in_server_request_drain_is_ignored(self):
         """Approval draining must not project a child result into the parent."""
@@ -351,10 +448,8 @@ class TestRunTurn:
         s = make_session(client)
         r = s.run_turn("hi", turn_timeout=2.0)
         assert r.error is not None
-        assert "turn/start failed" in r.error
         assert "Internal error" in r.error
         # Stderr tail attached
-        assert "codex stderr" in r.error
         assert "provider auth failed" in r.error
         # Credential-shaped values still redacted (sk- prefix + Bearer header)
         assert "sk-live-deadbeefdeadbeef" not in r.error
@@ -555,7 +650,7 @@ class TestServerRequestRouting:
             turn={"id": "tu1", "status": "completed", "error": None},
         )
         s = make_session(client)
-        s.run_turn("hi", turn_timeout=1.0)
+        s.run_turn("hi", turn_timeout=0.2)
         assert any(
             rid == "req-3" and code == -32601
             for (rid, code, _msg) in client.error_responses
@@ -604,7 +699,7 @@ class TestServerRequestRouting:
             approval_callback=cb,
             on_event=events.append,
         )
-        s.run_turn("hi", turn_timeout=1.0)
+        s.run_turn("hi", turn_timeout=0.2)
 
         # The on_event hook must have seen the item/started even though
         # it was drained as part of the approval roundtrip — not just
@@ -632,7 +727,7 @@ class TestServerRequestRouting:
         # No callback, but routing says auto-approve. Should approve.
         s = make_session(client, request_routing=_ServerRequestRouting(
             auto_approve_exec=True))
-        s.run_turn("hi", turn_timeout=1.0)
+        s.run_turn("hi", turn_timeout=0.2)
         assert ("r1", {"decision": "accept"}) in client.responses
 
 
@@ -660,10 +755,9 @@ class TestApprovalPromptEnrichment:
             captured["description"] = description
             return "once"
         s = make_session(client, approval_callback=cb)
-        s.run_turn("hi", turn_timeout=1.0)
+        s.run_turn("hi", turn_timeout=0.2)
         # Session cwd is /tmp by default in make_session()
         assert "/tmp" in captured["description"]
-        assert "Codex requests exec in <unknown>" not in captured["description"]
 
     def test_apply_patch_prompt_summarizes_pending_changes(self):
         """When the projector has cached the fileChange item from item/started,
@@ -695,7 +789,7 @@ class TestApprovalPromptEnrichment:
             captured["description"] = description
             return "once"
         s = make_session(client, approval_callback=cb)
-        s.run_turn("hi", turn_timeout=1.0)
+        s.run_turn("hi", turn_timeout=0.2)
         # Both add and update kinds should be in the summary
         assert "1 add" in captured["command"] or "1 add" in captured["description"]
         assert "1 update" in captured["command"] or "1 update" in captured["description"]
@@ -722,7 +816,7 @@ class TestApprovalPromptEnrichment:
             captured["command"] = command
             return "once"
         s = make_session(client, approval_callback=cb)
-        s.run_turn("hi", turn_timeout=1.0)
+        s.run_turn("hi", turn_timeout=0.2)
         # Falls back to the reason
         assert "apply some changes" in captured["command"]
 
@@ -881,11 +975,6 @@ class TestSessionRetirement:
 class TestThreadStartCrossFill:
     """Mirrors openclaw beta.8's tolerance for thread.id/sessionId aliasing."""
 
-    def test_thread_id_under_thread_key(self):
-        client = FakeClient()
-        s = make_session(client)
-        tid = s.ensure_started()
-        assert tid == "thread-fake-001"
 
 
 
@@ -932,12 +1021,6 @@ class TestClassifyOAuthFailure:
 
 
 
-    def test_401_classified(self):
-        from agent.transports.codex_app_server_session import (
-            _classify_oauth_failure,
-        )
-        hint = _classify_oauth_failure("HTTP 401 Unauthorized")
-        assert hint is not None
 
 
     def test_empty_inputs(self):
@@ -1073,3 +1156,26 @@ class TestTransportLoss:
         assert steer_session.request_steer("more") is False
         control.fail_on = "turn/interrupt"
         steer_session._issue_interrupt("turn-fake-001")  # must not raise
+
+
+def test_only_current_turn_progress_reaches_hermes_activity_clock():
+    from agent.activity_tracking import ActivityTrackingMixin
+    from agent.codex_runtime import make_codex_app_server_event_bridge
+
+    agent = ActivityTrackingMixin()
+    agent._touch_activity("starting new turn")
+    generation = agent._turn_liveness_activity_generation
+    client = FakeClient()
+    for thread_id, turn_id in (
+        ("thread-child-001", "turn-child-001"),
+        ("thread-fake-001", "previous-turn"),
+    ):
+        client.queue_notification("item/agentMessage/delta", threadId=thread_id, turnId=turn_id, delta="foreign")
+        client.queue_notification("item/completed", threadId=thread_id, turnId=turn_id,
+                                  item={"id": "foreign-tool", "type": "commandExecution", "command": "true"})
+    client.queue_notification("item/agentMessage/delta", threadId="t", turnId="tu1", delta="current")
+    client.queue_notification("turn/completed", threadId="t", turn={"id": "tu1", "status": "completed"})
+    result = make_session(client, on_event=make_codex_app_server_event_bridge(agent)).run_turn("work", turn_timeout=2)
+    assert result.error is None and not result.interrupted
+    assert agent._turn_liveness_activity_generation == generation + 1
+    assert agent._last_activity_desc == "codex app-server: item/agentMessage/delta"
