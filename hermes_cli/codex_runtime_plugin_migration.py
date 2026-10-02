@@ -364,7 +364,7 @@ def _query_codex_plugins(
 
 
 # pytest tempdir shapes: ``pytest-of-<user>/pytest-<n>/``, macOS ``/private/var/folders/…/T``.
-_TEST_TEMPDIR_NEEDLES = ("pytest-of-", "/pytest-", "/tmp/pytest", "/private/var/folders/")
+_TEST_TEMPDIR_NEEDLES = ("pytest-of-", "/pytest-", "/tmp/pytest", "/private/var/folders/")  # no-tmp: ok — detection needle for pytest temp homes
 
 
 def _looks_like_test_tempdir(path: str) -> bool:
@@ -475,7 +475,7 @@ def migrate(
     without_managed = ""
     if target.exists():
         try:
-            existing = target.read_text(encoding="utf-8")
+            existing = target.read_text(encoding="utf-8-sig")
         except Exception as exc:
             report.errors.append(f"could not read {target}: {exc}")
             return report
