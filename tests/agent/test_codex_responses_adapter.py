@@ -2,17 +2,15 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.message_sanitization import coerce_tool_name
 from agent.codex_responses_adapter import (
     _chat_content_to_responses_parts,
     _chat_messages_to_responses_input,
     _classify_responses_issuer,
-    _sanitize_replayed_fn_name,
-    _format_responses_error,
     _normalize_codex_response,
     _neutralize_harmony_tokens,
     _preflight_codex_api_kwargs,
     _preflight_codex_input_items,
-    _responses_tools,
 )
 
 
@@ -182,6 +180,7 @@ def test_preflight_rewrites_raw_assistant_images_to_text_markers():
     }]
 
     assert _preflight_codex_input_items(raw) == [{
+        "type": "message",
         "role": "assistant",
         "content": [{
             "type": "output_text",
@@ -493,27 +492,27 @@ def test_chat_messages_to_responses_input_keeps_short_call_id():
     assert output["call_id"] == "call_abc123"
 
 
-def test_sanitize_replayed_fn_name_valid_passthrough():
+def test_coerce_tool_name_valid_passthrough():
     """Valid names pass through unchanged (identity — cache-prefix safe)."""
     for name in ("web_search", "exec-command", "a1_B2-c3", "x" * 64):
-        assert _sanitize_replayed_fn_name(name) == name
+        assert coerce_tool_name(name) == name
 
 
-def test_sanitize_replayed_fn_name_coerces_invalid_chars():
-    assert _sanitize_replayed_fn_name("exec.command") == "exec_command"
-    assert _sanitize_replayed_fn_name("run shell cmd") == "run_shell_cmd"
-    assert _sanitize_replayed_fn_name("weird..__name") == "weird_name"
-    assert _sanitize_replayed_fn_name("  tool!  ") == "tool"
+def test_coerce_tool_name_coerces_invalid_chars():
+    assert coerce_tool_name("exec.command") == "exec_command"
+    assert coerce_tool_name("run shell cmd") == "run_shell_cmd"
+    assert coerce_tool_name("weird..__name") == "weird_name"
+    assert coerce_tool_name("  tool!  ") == "tool"
 
 
-def test_sanitize_replayed_fn_name_degenerate_inputs():
+def test_coerce_tool_name_degenerate_inputs():
     """All-invalid / non-string names degrade to a placeholder, never empty —
     an empty name would trade the API 400 for a preflight ValueError."""
-    assert _sanitize_replayed_fn_name("") == "fn"
-    assert _sanitize_replayed_fn_name("...") == "fn"
-    assert _sanitize_replayed_fn_name("日本語") == "fn"
-    assert _sanitize_replayed_fn_name(None) == "fn"
-    assert len(_sanitize_replayed_fn_name("a." * 100)) <= 64
+    assert coerce_tool_name("", fallback="fn") == "fn"
+    assert coerce_tool_name("...", fallback="fn") == "fn"
+    assert coerce_tool_name("日本語", fallback="fn") == "fn"
+    assert coerce_tool_name(None, fallback="fn") == "fn"
+    assert len(coerce_tool_name("a." * 100)) <= 64
 
 
 def test_chat_messages_to_responses_input_sanitizes_replayed_fn_name():
@@ -888,9 +887,6 @@ def test_preflight_passes_native_web_search_tool_through():
 # ---------------------------------------------------------------------------
 
 
-def test_format_responses_error_message_only():
-    err = {"message": "Upstream model unavailable"}
-    assert _format_responses_error(err, "failed") == "Upstream model unavailable"
 
 
 def _final_text_response(text):
@@ -984,3 +980,70 @@ def _xai_reasoning_only_response(reasoning_text):
             )
         ],
     )
+
+def test_codex_preflight_passes_text_verbosity_through():
+    """The preflight whitelist must let the Responses ``text`` block reach the wire (#20203).
+
+    Before it was allowed, ``text.verbosity`` died inside Hermes with
+    "unsupported field(s): text" before the request ever left the process.
+    """
+    kwargs = {
+        "model": "gpt-5.1", "instructions": "system", "store": False,
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "text": {"verbosity": "low"},
+    }
+    assert _preflight_codex_api_kwargs(dict(kwargs))["text"] == {"verbosity": "low"}
+    # An empty block is dropped, like the other optional fields, instead of rejected.
+    assert "text" not in _preflight_codex_api_kwargs({**kwargs, "text": {}})
+
+
+@pytest.mark.parametrize("issuer", [None, "codex_backend"])
+def test_converter_role_items_are_typed_and_survive_preflight(issuer):
+    """llama.cpp's /v1/responses rejects typeless message items; preflight must accept every
+    item the converter emits, including user image parts."""
+    items = _chat_messages_to_responses_input([
+        {"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]},
+        {"role": "assistant", "content": "a cat"},
+        {"role": "assistant", "content": "", "codex_reasoning_items": [
+            {"type": "reasoning", "encrypted_content": "opaque", "summary": []},
+        ]},
+        {"role": "user", "content": "thanks"},
+    ], current_issuer_kind=issuer)
+
+    normalized = _preflight_codex_input_items(items)
+
+    role_items = [i for i in normalized if i.get("role")]
+    assert role_items and all(i["type"] == "message" for i in role_items)
+    assert {"type": "input_image", "image_url": "data:image/png;base64,AAAA"} in role_items[0]["content"]
+    assert normalized == items
+
+
+@pytest.mark.parametrize("issuer", [None, "codex_backend"])
+@pytest.mark.parametrize("structured", [False, True])
+def test_role_message_phase_survives_conversion_and_preflight(issuer, structured):
+    """Assistant phase is resent through conversion and preflight, per OpenAI's replay guidance."""
+    content = [{"type": "text", "text": "Checking."}] if structured else "Checking."
+    history = [
+        {"role": "user", "content": "audit"},
+        {"role": "assistant", "content": content, "phase": " Commentary "},
+    ]
+    converted = _chat_messages_to_responses_input(history, current_issuer_kind=issuer)
+
+    normalized = _preflight_codex_api_kwargs({"model": "m", "instructions": "i", "input": converted, "store": False})
+
+    assert converted[-1]["phase"] == "commentary"
+    assert normalized["input"] == converted
+
+
+def test_role_message_phase_is_kept_only_for_assistant_values_the_api_accepts():
+    wire = _preflight_codex_input_items([
+        {"role": "assistant", "content": "a", "phase": "final_answer"},
+        {"role": "assistant", "content": "b", "phase": "analysis"},
+        {"role": "assistant", "content": "c", "phase": 42},
+        {"role": "user", "content": "d", "phase": "commentary"},
+    ])
+
+    assert [item.get("phase") for item in wire] == ["final_answer", None, None, None]
