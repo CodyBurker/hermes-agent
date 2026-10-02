@@ -382,6 +382,24 @@ def _clear_stale_index_lock(index_file: Path) -> None:
         _unlink_quiet(lock)
 
 
+def _too_broad_dirs() -> Set[str]:
+    """Directories never snapshotted: ``/``, home, and the shared system temp roots.  A scratch file
+    written to ``/tmp/x.py`` has no project marker above it, so its working dir resolves to ``/tmp``
+    itself — world-writable, full of other processes' files, unreadable ``systemd-private-*`` dirs and
+    files that vanish mid-scan, where ``git add -A`` is slow and fails.  Projects *inside* a temp root
+    are still checkpointed.  Paths are symlink-resolved (macOS ``/tmp`` -> ``/private/tmp``)."""
+    roots = [Path("/"), Path.home(), Path(tempfile.gettempdir()), Path("/tmp"), Path("/var/tmp"),
+             Path("/private/tmp"), Path("/private/var/tmp")]
+    out: Set[str] = set()
+    for root in roots:
+        out.add(str(root))
+        try:
+            out.add(str(root.resolve()))
+        except OSError:  # pragma: no cover — unresolvable root: the literal path still guards
+            pass
+    return out
+
+
 def _run_git(
     args: List[str],
     store: Path,
@@ -959,7 +977,7 @@ class CheckpointManager:
         abs_dir = str(_normalize_path(working_dir))
 
         # Skip root, home, and other overly broad directories
-        if abs_dir in {"/", str(Path.home())}:
+        if abs_dir in _too_broad_dirs():  # never snapshot root, home or a shared temp root
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
             return False
 
